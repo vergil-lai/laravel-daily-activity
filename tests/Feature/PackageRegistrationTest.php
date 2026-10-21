@@ -20,6 +20,13 @@ it('resolves independent Eloquent model instances', function () {
         ->not->toBe(app(DailyActivity::class));
 });
 
+it('merges the cache key without replacing host overrides', function () {
+    expect(config('daily-activity.cache_key'))->toBe('daily-activity');
+    config()->set('daily-activity.cache_key', 'custom-activity');
+    (new DailyActivityServiceProvider(app()))->register();
+    expect(config('daily-activity.cache_key'))->toBe('custom-activity');
+});
+
 it('publishes configuration using the documented filename', function () {
     $path = config_path('daily-activity.php');
 

@@ -75,12 +75,85 @@ it('marks once with or without a cache hit and avoids all queries on a cache hit
     expect($model->currentStreakFor($subject, 'login'))->toBe(1);
 });
 
+it('uses the configured cache key for writes and cache hits', function () {
+    config()->set('daily-activity.cache_key', 'custom-activity');
+    $subject = activitySubject();
+    expect($subject->recordDailyActivity('login'))->toBeTrue();
+    $key = array_key_first(Cache::getStore()->all());
+    expect($key)->toMatch('/\Acustom-activity:login:[a-f0-9]{64}\z/');
+    DB::enableQueryLog();
+    DB::flushQueryLog();
+    expect($subject->recordDailyActivity('login'))->toBeFalse();
+    expect(DB::getQueryLog())->toBeEmpty();
+});
+
+it('only reads the current year when the current streak ends within it', function () {
+    $subject = activitySubject();
+    foreach (['2024-12-31', '2026-10-21', '2026-10-22'] as $date) {
+        recordActivityOn($subject, $date);
+    }
+    DB::enableQueryLog();
+    DB::flushQueryLog();
+    expect($subject->currentActivityStreak('login'))->toBe(2);
+    $queries = DB::getQueryLog();
+    expect($queries)->toHaveCount(1);
+    expect($queries[0]['bindings'])->toBe([$subject->getMorphClass(), $subject->getKey(), 'login', 2026]);
+});
+
+it('reads preceding years only while the current streak continues', function (string $today, array $years, int $expected, array $queriedYears) {
+    $subject = activitySubject();
+    foreach ($years as $year => $dates) {
+        if ($dates === 'full') {
+            DailyActivity::create([
+                'subject_type' => $subject->getMorphClass(), 'subject_id' => $subject->getKey(),
+                'action' => 'login', 'year' => $year, 'days' => str_repeat("\xff", 46),
+            ]);
+        } else {
+            foreach ($dates as $date) {
+                recordActivityOn($subject, $date);
+            }
+        }
+    }
+    CarbonImmutable::setTestNow($today.' 12:00:00');
+    DB::enableQueryLog();
+    DB::flushQueryLog();
+    expect($subject->currentActivityStreak('login'))->toBe($expected);
+    $queries = DB::getQueryLog();
+    expect($queries)->toHaveCount(count($queriedYears));
+    foreach ($queriedYears as $index => $year) {
+        expect($queries[$index]['bindings'])->toBe([$subject->getMorphClass(), $subject->getKey(), 'login', $year]);
+    }
+})->with([
+    'unmarked new year day' => ['2027-01-01', [2026 => ['2026-12-30', '2026-12-31']], 2, [2027, 2026]],
+    'future marks do not extend the current streak' => ['2027-01-01', [2026 => ['2026-12-30', '2026-12-31'], 2027 => ['2027-01-03']], 2, [2027, 2026]],
+    'missing current year after new year day' => ['2027-01-02', [2026 => ['2026-12-31']], 0, [2027]],
+    'gap on new year day' => ['2027-01-02', [2026 => ['2026-12-31'], 2027 => ['2027-01-02']], 1, [2027]],
+    'missing preceding year' => ['2027-01-02', [2025 => ['2025-12-31'], 2027 => ['2027-01-01', '2027-01-02']], 2, [2027, 2026]],
+    'whole leap year and padding bits' => ['2025-01-01', [2023 => ['2023-12-31'], 2024 => 'full', 2025 => ['2025-01-01']], 368, [2025, 2024, 2023]],
+    'whole non-leap year and reserved bits' => ['2026-01-01', [2024 => ['2024-12-31'], 2025 => 'full', 2026 => ['2026-01-01']], 367, [2026, 2025, 2024]],
+    'no activity' => ['2026-10-22', [], 0, [2026]],
+]);
+
+it('starts the backward streak scan on the application timezone date', function () {
+    config()->set('app.timezone', 'Asia/Shanghai');
+    $subject = activitySubject();
+    recordActivityOn($subject, '2026-12-31');
+    CarbonImmutable::setTestNow(CarbonImmutable::parse('2026-12-31 16:30:00', 'UTC'));
+    expect($subject->currentActivityStreak('login'))->toBe(1);
+    expect($subject->recordDailyActivity('login'))->toBeTrue();
+    expect($subject->currentActivityStreak('login'))->toBe(2);
+});
+
 it('isolates actions and morph classes for the same key', function () {
     $subject = activitySubject();
     $other = OtherSubject::findOrFail($subject->id);
     $model = new DailyActivity;
     expect($model->recordFor($subject, 'login'))->toBeTrue();
     expect($model->recordFor($subject, 'check-in'))->toBeTrue();
+    $keys = array_keys(Cache::getStore()->all());
+    expect($keys)->toHaveCount(2);
+    expect($keys[0])->toMatch('/\Adaily-activity:login:[a-f0-9]{64}\z/');
+    expect($keys[1])->toBe('daily-activity:check-in:'.substr($keys[0], -64));
     expect($model->recordFor($other, 'login'))->toBeTrue();
     expect(DailyActivity::count())->toBe(3);
     expect($model->currentStreakFor($subject, 'missing'))->toBe(0);
@@ -231,7 +304,7 @@ it('publishes a success cache only after the outer transaction commits', functio
     DB::commit();
     expect(Cache::getStore()->all())->toHaveCount(1);
     $key = array_key_first(Cache::getStore()->all());
-    expect($key)->toMatch('/\Adaily-activity:[a-f0-9]{64}\z/');
+    expect($key)->toMatch('/\Adaily-activity:login:[a-f0-9]{64}\z/');
 });
 
 it('does not cache a rolled back record', function () {

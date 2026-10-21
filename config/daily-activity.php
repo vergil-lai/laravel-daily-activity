@@ -5,4 +5,5 @@ use VergilLai\DailyActivity\DailyActivity;
 
 return [
     'model' => DailyActivity::class,
+    'cache_key' => 'daily-activity',
 ];

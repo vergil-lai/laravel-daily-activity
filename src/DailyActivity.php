@@ -32,6 +32,8 @@ class DailyActivity extends Model
 
     /**
      * 注册创建事件，为未指定 days 的新记录初始化全零的 46 字节位图。
+     *
+     * @return void 无返回值，注册活动记录的创建事件。
      */
     protected static function booted(): void
     {
@@ -45,7 +47,7 @@ class DailyActivity extends Model
     /**
      * 定义位图的二进制转换器和年份的整数转换规则。
      *
-     * @return array<string, class-string|string>
+     * @return array<string, class-string|string> 属性名与类型转换规则的映射。
      */
     protected function casts(): array
     {
@@ -55,7 +57,7 @@ class DailyActivity extends Model
     /**
      * 获取活动记录所属主体的多态关联。
      *
-     * @return MorphTo<Model, $this>
+     * @return MorphTo<Model, $this> 活动记录所属主体的多态关联。
      */
     public function subject(): MorphTo
     {
@@ -65,6 +67,11 @@ class DailyActivity extends Model
     /**
      * 为指定主体标记指定日期的活动，省略日期时默认今天，通过缓存去重和比较后更新保留并发标记。
      * 首次设置目标日期对应位时返回 true，重复标记返回 false，连续五次更新冲突后抛出异常。
+     *
+     * @param  Model  $subject  已持久化且具有主键的活动主体模型。
+     * @param  string  $action  活动类型标识，长度为 1 至 64 个字符，仅允许小写英文字母、数字、点、下划线、冒号和连字符。
+     * @param  CarbonInterface|string|null  $date  目标日期，按应用时区解析；传入 null 或省略时使用今天。
+     * @return bool 首次标记目标日期时为 true，重复标记时为 false。
      */
     public function recordFor(Model $subject, string $action, CarbonInterface|string|null $date = null): bool
     {
@@ -73,9 +80,9 @@ class DailyActivity extends Model
         $date = $date === null ? $now : $this->activityDate($date);
         $model = $query->getModel();
         $connection = $model->getConnection();
-        $key = 'daily-activity:'.hash('sha256', json_encode([
+        $key = config('daily-activity.cache_key', 'daily-activity').':'.$action.':'.hash('sha256', json_encode([
             $connection->getName(), $connection->getDatabaseName(), $model->getTable(),
-            $model::class, $subject->getMorphClass(), $subject->getKey(), $action,
+            $model::class, $subject->getMorphClass(), $subject->getKey(),
             $date->toDateString(), $date->getTimezone()->getName(),
         ], JSON_THROW_ON_ERROR));
 
@@ -125,25 +132,93 @@ class DailyActivity extends Model
     }
 
     /**
-     * 获取指定主体和活动的当前连续天数，今天未标记时保留截至昨天的连续记录。
+     * 从今天向前按需读取年度位图，遇到未标记日期即停止，今天未标记时从昨天开始统计。
+     *
+     * @param  Model  $subject  已持久化且具有主键的活动主体模型。
+     * @param  string  $action  活动类型标识，长度为 1 至 64 个字符，仅允许小写英文字母、数字、点、下划线、冒号和连字符。
+     * @return int 当前连续活动天数，今天未标记时保留截至昨天的连续记录。
      */
     public function currentStreakFor(Model $subject, string $action): int
     {
-        return $this->streaksFor($subject, $action)[0];
+        $query = $this->queryFor($subject, $action);
+        $today = CarbonImmutable::now(config('app.timezone', 'UTC'));
+        $year = $today->year;
+        $offset = $today->dayOfYear - 1;
+        $run = 0;
+
+        while ($year >= 1) {
+            $activity = (clone $query)->where('year', $year)->first(['days']);
+            $days = $activity?->days;
+
+            for (; $offset >= 0; $offset--) {
+                if ($days !== null && self::marked($days, $offset)) {
+                    $run++;
+                } elseif ($year !== $today->year || $offset !== $today->dayOfYear - 1) {
+                    return $run;
+                }
+            }
+
+            $year--;
+            // 只扫描实际日历日期，忽略非闰年的预留位及位图末尾的填充位。
+            $offset = ($year % 4 === 0 && $year % 100 !== 0) || $year % 400 === 0 ? 365 : 364;
+        }
+
+        return $run;
     }
 
     /**
      * 获取指定主体和活动截至今天的历史最长连续天数，支持跨年计算。
+     *
+     * @param  Model  $subject  已持久化且具有主键的活动主体模型。
+     * @param  string  $action  活动类型标识，长度为 1 至 64 个字符，仅允许小写英文字母、数字、点、下划线、冒号和连字符。
+     * @return int 截至今天的历史最长连续活动天数，支持跨年计算。
      */
     public function longestStreakFor(Model $subject, string $action): int
     {
-        return $this->streaksFor($subject, $action)[1];
+        $query = $this->queryFor($subject, $action);
+        $today = CarbonImmutable::now(config('app.timezone', 'UTC'));
+        $rows = $query->whereBetween('year', [1, $today->year])->orderBy('year')->get(['year', 'days']);
+        $lookup = self::byteStreaks();
+        $run = $longest = 0;
+        $previousYear = null;
+
+        foreach ($rows as $row) {
+            $year = $row->year;
+
+            if ($previousYear !== $year - 1) {
+                $run = 0;
+            }
+            $leap = ($year % 4 === 0 && $year % 100 !== 0) || $year % 400 === 0;
+            $limit = $year === $today->year ? $today->dayOfYear : ($leap ? 366 : 365);
+            $days = $row->days;
+            $fullBytes = intdiv($limit, 8);
+
+            for ($byte = 0; $byte < $fullBytes; $byte++) {
+                [$prefix, $suffix, $within] = $lookup[ord($days[$byte])];
+                $longest = max($longest, $run + $prefix, $within);
+                $run = $prefix === 8 ? $run + 8 : $suffix;
+            }
+
+            // 最后不足一个字节的部分逐位处理，不将未来位、预留位或填充位计入连续记录。
+            for ($offset = $fullBytes * 8; $offset < $limit; $offset++) {
+                $run = self::marked($days, $offset) ? $run + 1 : 0;
+                $longest = max($longest, $run);
+            }
+            $previousYear = $year;
+        }
+
+        return $longest;
     }
 
     /**
      * 一次查询相关年份的位图，按日期升序返回包含起止日期的每日活动状态。
      *
-     * @return array<string, bool>
+     * @param  Model  $subject  已持久化且具有主键的活动主体模型。
+     * @param  string  $action  活动类型标识，长度为 1 至 64 个字符，仅允许小写英文字母、数字、点、下划线、冒号和连字符。
+     * @param  CarbonInterface|string  $start  查询起始日期，包含当天，按应用时区解析。
+     * @param  CarbonInterface|string  $end  查询结束日期，包含当天，不得早于起始日期。
+     * @param  string  $format  返回数组中日期键的格式，默认为 Y-m-d。
+     * @return array<string, bool> 按日期升序排列的每日活动状态，键为格式化日期，值表示是否已标记。
      */
     public function dateRangeFor(Model $subject, string $action, CarbonInterface|string $start, CarbonInterface|string $end, string $format = 'Y-m-d'): array
     {
@@ -169,7 +244,10 @@ class DailyActivity extends Model
     /**
      * 按应用时区返回指定主体当前整个月的每日活动状态，包含未来日期。
      *
-     * @return array<string, bool>
+     * @param  Model  $subject  已持久化且具有主键的活动主体模型。
+     * @param  string  $action  活动类型标识，长度为 1 至 64 个字符，仅允许小写英文字母、数字、点、下划线、冒号和连字符。
+     * @param  string  $format  返回数组中日期键的格式，默认为 Y-m-d。
+     * @return array<string, bool> 本月每日活动状态，键为格式化日期，值表示是否已标记，包含未来日期。
      */
     public function currentMonthFor(Model $subject, string $action, string $format = 'Y-m-d'): array
     {
@@ -181,7 +259,10 @@ class DailyActivity extends Model
     /**
      * 按应用时区返回本周一至周日的每日活动状态。
      *
-     * @return array<string, bool>
+     * @param  Model  $subject  已持久化且具有主键的活动主体模型。
+     * @param  string  $action  活动类型标识，长度为 1 至 64 个字符，仅允许小写英文字母、数字、点、下划线、冒号和连字符。
+     * @param  string  $format  返回数组中日期键的格式，默认为 Y-m-d。
+     * @return array<string, bool> 本周一至周日的每日活动状态，键为格式化日期，值表示是否已标记。
      */
     public function currentWeekFor(Model $subject, string $action, string $format = 'Y-m-d'): array
     {
@@ -190,43 +271,88 @@ class DailyActivity extends Model
         return $this->dateRangeFor($subject, $action, $now->startOfWeek(CarbonInterface::MONDAY), $now->endOfWeek(CarbonInterface::SUNDAY), $format);
     }
 
-    /** 获取指定日期区间内的活动总天数，包含起止日期。 */
+    /**
+     * 获取指定日期区间内的活动总天数，包含起止日期。
+     *
+     * @param  Model  $subject  已持久化且具有主键的活动主体模型。
+     * @param  string  $action  活动类型标识，长度为 1 至 64 个字符，仅允许小写英文字母、数字、点、下划线、冒号和连字符。
+     * @param  CarbonInterface|string  $start  查询起始日期，包含当天，按应用时区解析。
+     * @param  CarbonInterface|string  $end  查询结束日期，包含当天，不得早于起始日期。
+     * @return int 指定日期范围内已标记的总天数，包含起止日期。
+     */
     public function daysInRangeFor(Model $subject, string $action, CarbonInterface|string $start, CarbonInterface|string $end): int
     {
         return count(array_filter($this->dateRangeFor($subject, $action, $start, $end)));
     }
 
-    /** 获取本月的活动总天数。 */
+    /**
+     * 获取本月的活动总天数。
+     *
+     * @param  Model  $subject  已持久化且具有主键的活动主体模型。
+     * @param  string  $action  活动类型标识，长度为 1 至 64 个字符，仅允许小写英文字母、数字、点、下划线、冒号和连字符。
+     * @return int 本月已标记的总天数。
+     */
     public function currentMonthDaysFor(Model $subject, string $action): int
     {
         return count(array_filter($this->currentMonthFor($subject, $action)));
     }
 
-    /** 获取本周一至周日的活动总天数。 */
+    /**
+     * 获取本周一至周日的活动总天数。
+     *
+     * @param  Model  $subject  已持久化且具有主键的活动主体模型。
+     * @param  string  $action  活动类型标识，长度为 1 至 64 个字符，仅允许小写英文字母、数字、点、下划线、冒号和连字符。
+     * @return int 本周一至周日已标记的总天数。
+     */
     public function currentWeekDaysFor(Model $subject, string $action): int
     {
         return count(array_filter($this->currentWeekFor($subject, $action)));
     }
 
-    /** 获取指定日期区间内的最长连续活动天数，不计入区间外的记录。 */
+    /**
+     * 获取指定日期区间内的最长连续活动天数，不计入区间外的记录。
+     *
+     * @param  Model  $subject  已持久化且具有主键的活动主体模型。
+     * @param  string  $action  活动类型标识，长度为 1 至 64 个字符，仅允许小写英文字母、数字、点、下划线、冒号和连字符。
+     * @param  CarbonInterface|string  $start  查询起始日期，包含当天，按应用时区解析。
+     * @param  CarbonInterface|string  $end  查询结束日期，包含当天，不得早于起始日期。
+     * @return int 指定日期范围内的最长连续活动天数，不计入区间外的记录。
+     */
     public function longestStreakInRangeFor(Model $subject, string $action, CarbonInterface|string $start, CarbonInterface|string $end): int
     {
         return $this->longestStreakInDays($this->dateRangeFor($subject, $action, $start, $end));
     }
 
-    /** 获取本月内的最长连续活动天数。 */
+    /**
+     * 获取本月内的最长连续活动天数。
+     *
+     * @param  Model  $subject  已持久化且具有主键的活动主体模型。
+     * @param  string  $action  活动类型标识，长度为 1 至 64 个字符，仅允许小写英文字母、数字、点、下划线、冒号和连字符。
+     * @return int 本月内的最长连续活动天数。
+     */
     public function currentMonthLongestStreakFor(Model $subject, string $action): int
     {
         return $this->longestStreakInDays($this->currentMonthFor($subject, $action));
     }
 
-    /** 获取本周一至周日内的最长连续活动天数。 */
+    /**
+     * 获取本周一至周日内的最长连续活动天数。
+     *
+     * @param  Model  $subject  已持久化且具有主键的活动主体模型。
+     * @param  string  $action  活动类型标识，长度为 1 至 64 个字符，仅允许小写英文字母、数字、点、下划线、冒号和连字符。
+     * @return int 本周一至周日内的最长连续活动天数。
+     */
     public function currentWeekLongestStreakFor(Model $subject, string $action): int
     {
         return $this->longestStreakInDays($this->currentWeekFor($subject, $action));
     }
 
-    /** @param array<string, bool> $days 按日期升序排列的每日活动状态。 */
+    /**
+     * 计算每日活动状态中的最长连续天数。
+     *
+     * @param  array<string, bool>  $days  按日期升序排列的每日活动状态。
+     * @return int 每日活动状态中的最长连续活动天数，无活动时为 0。
+     */
     private function longestStreakInDays(array $days): int
     {
         $run = $longest = 0;
@@ -241,6 +367,11 @@ class DailyActivity extends Model
 
     /**
      * 判断指定主体在应用时区下的指定日期是否已标记对应活动。
+     *
+     * @param  Model  $subject  已持久化且具有主键的活动主体模型。
+     * @param  string  $action  活动类型标识，长度为 1 至 64 个字符，仅允许小写英文字母、数字、点、下划线、冒号和连字符。
+     * @param  CarbonInterface|string  $date  目标日期，按应用时区解析。
+     * @return bool 指定日期已标记时为 true，否则为 false。
      */
     public function hasActivityOnFor(Model $subject, string $action, CarbonInterface|string $date): bool
     {
@@ -251,6 +382,9 @@ class DailyActivity extends Model
 
     /**
      * 将日期转换为应用时区下当天零点的不可变对象，不修改传入对象。
+     *
+     * @param  CarbonInterface|string  $date  目标日期，按应用时区解析。
+     * @return CarbonImmutable 应用时区下目标日期当天零点的不可变日期对象。
      */
     private function activityDate(CarbonInterface|string $date): CarbonImmutable
     {
@@ -262,7 +396,9 @@ class DailyActivity extends Model
     /**
      * 校验主体和活动标识，选择模型连接并构建限定主体与活动类型的查询。
      *
-     * @return Builder<covariant self>
+     * @param  Model  $subject  已持久化且具有主键的活动主体模型。
+     * @param  string  $action  活动类型标识，长度为 1 至 64 个字符，仅允许小写英文字母、数字、点、下划线、冒号和连字符。
+     * @return Builder<covariant self> 已限定主体、活动类型和数据库连接的活动查询构造器。
      */
     private function queryFor(Model $subject, string $action): Builder
     {
@@ -282,48 +418,44 @@ class DailyActivity extends Model
     }
 
     /**
-     * 扫描截至今天的年度位图，返回当前连续天数和历史最长连续天数。
+     * 为全部 256 种字节值构建连续标记摘要，在当前进程内复用查表结果。
      *
-     * @return array{int, int}
+     * @return array<int, array{int, int, int}> 以字节值为键，依次包含开头、末尾和内部最长连续标记数。
      */
-    private function streaksFor(Model $subject, string $action): array
+    private static function byteStreaks(): array
     {
-        $query = $this->queryFor($subject, $action);
-        $today = CarbonImmutable::now(config('app.timezone', 'UTC'))->startOfDay();
-        $rows = $query->whereBetween('year', [1, $today->year])->orderBy('year')->get(['year', 'days']);
-        $run = $longest = 0;
-        $previousYear = null;
-        $lastMarked = null;
+        static $lookup = [];
 
-        foreach ($rows as $row) {
-            if ($previousYear !== $row->year - 1) {
-                $run = 0;
-            }
-            $start = $today->setDate($row->year, 1, 1);
-            $limit = $row->year === $today->year ? $today->dayOfYear : $start->daysInYear;
-            $days = $row->days;
-            for ($offset = 0; $offset < $limit; $offset++) {
-                if (self::marked($days, $offset)) {
-                    $run++;
-                    $longest = max($longest, $run);
-                    $lastMarked = $start->addDays($offset);
-                } else {
-                    // 今天尚未标记时，保留截至昨天的连续天数。
-                    if ($row->year !== $today->year || $offset !== $today->dayOfYear - 1) {
-                        $run = 0;
-                    }
-                }
-            }
-            $previousYear = $row->year;
+        if ($lookup !== []) {
+            return $lookup;
         }
 
-        $current = $lastMarked !== null && $lastMarked->greaterThanOrEqualTo($today->subDay()) ? $run : 0;
+        for ($value = 0; $value < 256; $value++) {
+            $prefix = $suffix = $longest = 0;
+            for ($bit = 7; $bit >= 0; $bit--) {
+                if (($value & (1 << $bit)) !== 0) {
+                    $suffix++;
+                    $longest = max($longest, $suffix);
 
-        return [$current, $longest];
+                    if ($prefix === 7 - $bit) {
+                        $prefix++;
+                    }
+                } else {
+                    $suffix = 0;
+                }
+            }
+            $lookup[$value] = [$prefix, $suffix, $longest];
+        }
+
+        return $lookup;
     }
 
     /**
      * 按高位优先的位图顺序，判断从零开始的日期偏移是否已标记。
+     *
+     * @param  string  $days  按高位优先顺序存储的 46 字节年度活动位图。
+     * @param  int  $offset  从零开始的年内日期偏移，1 月 1 日为 0。
+     * @return bool 指定日期偏移已标记时为 true，否则为 false。
      */
     private static function marked(string $days, int $offset): bool
     {
@@ -332,6 +464,11 @@ class DailyActivity extends Model
 
     /**
      * 在最外层事务提交后缓存成功标记，无事务时立即写入，有效期至本次操作当天结束。
+     *
+     * @param  self  $model  用于获取数据库连接及事务状态的活动模型。
+     * @param  string  $key  包含前缀、活动类型和哈希的完整缓存键。
+     * @param  CarbonImmutable  $now  本次操作的时间，用于确定缓存过期时间，避免跨日提交改变有效期。
+     * @return void 无返回值，在事务提交后或无事务时写入成功缓存。
      */
     private function cacheAfterCommit(self $model, string $key, CarbonImmutable $now): void
     {

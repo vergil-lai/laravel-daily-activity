@@ -10,6 +10,8 @@ class DailyActivityServiceProvider extends ServiceProvider
 {
     /**
      * 合并扩展包默认配置，保留宿主应用已设置的配置值。
+     *
+     * @return void 无返回值，合并扩展包默认配置。
      */
     public function register(): void
     {
@@ -18,6 +20,8 @@ class DailyActivityServiceProvider extends ServiceProvider
 
     /**
      * 仅在控制台环境中注册配置文件和数据库迁移的资源发布标签。
+     *
+     * @return void 无返回值，仅在控制台环境中注册资源发布标签。
      */
     public function boot(): void
     {
