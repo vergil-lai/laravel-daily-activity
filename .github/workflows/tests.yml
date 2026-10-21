@@ -1,0 +1,128 @@
+name: tests
+
+on:
+  push:
+    branches:
+      - main
+      - '*.x'
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        php: [8.3, 8.4, 8.5]
+        laravel: [12.*, 13.*]
+        stability: [prefer-lowest, prefer-stable]
+        include:
+          - laravel: 12.*
+            testbench: 10.*
+          - laravel: 13.*
+            testbench: 11.*
+
+    name: P${{ matrix.php }} - L${{ matrix.laravel }} - ${{ matrix.stability }} - ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: dom, curl, libxml, mbstring, zip, fileinfo, sqlite, pdo_sqlite, bcmath, intl
+          ini-values: error_reporting=E_ALL
+          tools: composer:v2
+          coverage: none
+
+      - name: Install dependencies
+        run: |
+          composer require --dev "laravel/framework:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
+          composer update --${{ matrix.stability }} --prefer-dist --no-interaction --no-progress --no-scripts
+          composer run prepare
+
+      - name: PHPStan
+        run: composer analyse
+
+      - name: Linter
+        run: composer lint:check
+
+      - name: Type Coverage
+        if: runner.os != 'Windows'
+        run: composer test:types
+
+      - name: Test Suite
+        if: runner.os != 'Windows'
+        run: composer test:unit
+
+      - name: Test Suite (Windows)
+        if: runner.os == 'Windows'
+        run: vendor/bin/pest
+
+  databases:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        laravel: [12.*, 13.*]
+        database: [mysql, pgsql]
+        include:
+          - laravel: 12.*
+            testbench: 10.*
+          - laravel: 13.*
+            testbench: 11.*
+    name: L${{ matrix.laravel }} - ${{ matrix.database }}
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: activity_test
+          MYSQL_DATABASE: daily_activity_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pactivity_test"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: activity_test
+          POSTGRES_PASSWORD: activity_test
+          POSTGRES_DB: daily_activity_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd="pg_isready -U activity_test -d daily_activity_test"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    env:
+      DAILY_ACTIVITY_TEST_DB: ${{ matrix.database }}
+      DAILY_ACTIVITY_TEST_HOST: 127.0.0.1
+      DAILY_ACTIVITY_TEST_PORT: ${{ matrix.database == 'mysql' && '3306' || '5432' }}
+      DAILY_ACTIVITY_TEST_USER: ${{ matrix.database == 'mysql' && 'root' || 'activity_test' }}
+      DAILY_ACTIVITY_TEST_PASSWORD: activity_test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup PHP
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+        with:
+          php-version: '8.4'
+          extensions: pdo_mysql, pdo_pgsql, pdo_sqlite, mbstring, dom, intl
+          tools: composer:v2
+          coverage: none
+      - name: Install dependencies
+        run: |
+          composer require --dev "laravel/framework:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
+          composer update --prefer-stable --prefer-dist --no-interaction --no-progress --no-scripts
+          composer run prepare
+      - name: Real database suite including concurrent workers
+        run: vendor/bin/pest
