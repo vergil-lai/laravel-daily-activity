@@ -63,7 +63,21 @@ $user->dailyActivities; // MorphMany，包含所有活动类型和年份
 
 在登录事件、需要身份认证的接口或其他业务入口中调用 `recordDailyActivity()`。此扩展包不会注册应用路由或定时器。活动记录的 `subject()` 关联可解析出原始模型，并遵循 Laravel 的多态映射（morph map）。
 
-活动类型（action）是区分大小写的机器标识符，长度为 1–64 个字符，仅允许小写 ASCII 字母、数字以及 `.`, `_`, `-`, `:`。无效的活动类型或尚未保存的主体模型会触发 `InvalidArgumentException`。此扩展包不会隐式保存主体模型，也不支持补录历史、取消标记或统计重复事件次数。
+活动类型（action）是区分大小写的机器标识符，长度为 1–64 个字符，仅允许小写 ASCII 字母、数字以及 `.`, `_`, `-`, `:`。无效的活动类型或尚未保存的主体模型会触发 `InvalidArgumentException`。此扩展包不会隐式保存主体模型，也不支持取消标记或统计重复事件次数。
+
+### 指定日期与补签
+
+`recordDailyActivity(string $action, Carbon\CarbonInterface|string|null $date = null): bool` 的日期参数可选，省略或传入 `null` 时记录今天。传入历史日期可用于补签：
+
+```php
+$user->recordDailyActivity('login'); // 记录今天
+$user->recordDailyActivity('login', '2026-10-21'); // 补签指定日期
+$user->recordDailyActivity('login', Carbon\CarbonImmutable::parse('2026-10-20'));
+```
+
+日期会转换到 `app.timezone` 后取对应的日历日期，传入的 Carbon 对象不会被修改。首次标记目标日期返回 `true`，重复标记返回 `false`；补签后，活动天数和连续天数统计会包含该日期。扩展包不限制可指定的日期范围或补签次数，相关业务规则由调用方控制。
+
+活动模型对应方法为 `recordFor($subject, $action, $date = null)`，日期参数与 trait 方法一致。
 
 ### 查询活动日期
 
@@ -164,7 +178,7 @@ $table->ulidMorphs('subject'); // ULID 主键
 
 每个主体、活动类型和年份的组合占用一行记录，在 `days` 字段中存储一个 **46 字节的位图**：MySQL/SQLite 使用可移植的 BLOB 类型，PostgreSQL 使用 BYTEA。1 月 1 日对应第 0 个字节的最高位；前 366 位表示日历日期，剩余两位用于填充。平年仅使用其中的 365 个日期位。年份列使用 Laravel 的 `year()` 建表方法（MySQL 使用原生 YEAR 类型，PostgreSQL/SQLite 使用框架映射的类型）。新记录的位图字节均初始化为零；记录不包含时间戳。此二进制属性不会出现在数组或 JSON 输出中，但可以通过 `$activity->days` 访问。
 
-宿主应用的默认缓存用于对当天成功的标记去重，有效期至本次操作所获取日期的当天结束。缓存键以 `daily-activity:` 开头，并对连接、数据库、表、模型、主体、活动类型、日期和时区进行哈希。缓存出错时会报告错误，并回退到数据库完成记录。使用相同存储标识的无关应用之间，请勿共享缓存命名空间。
+宿主应用的默认缓存用于对目标日期成功的标记去重，有效期至本次操作当天结束（补签时也如此）。缓存键以 `daily-activity:` 开头，并对连接、数据库、表、模型、主体、活动类型、目标日期和时区进行哈希。缓存出错时会报告错误，并回退到数据库完成记录。使用相同存储标识的无关应用之间，请勿共享缓存命名空间。
 
 记录活动时通过写连接读取数据，冲突重试时也如此，以避免副本延迟。统计使用常规查询连接，并遵循宿主应用的读写一致性设置。即使没有缓存，数据库唯一约束和二进制比较后设置（compare-and-set）更新也能保留并发标记。比较失败时会重新加载数据并重试，最多尝试五次，之后抛出 `RuntimeException`，避免静默丢弃事件。批量记录会绕过逐行触发的 Eloquent 更新事件。此机制不需要长时间的内部事务或行锁支持。
 

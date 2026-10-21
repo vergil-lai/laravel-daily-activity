@@ -2,7 +2,9 @@
 
 declare(strict_types=1);
 
+use Carbon\Carbon;
 use Carbon\CarbonImmutable;
+use Carbon\Exceptions\InvalidFormatException;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Cache;
@@ -83,6 +85,73 @@ it('isolates actions and morph classes for the same key', function () {
     expect(DailyActivity::count())->toBe(3);
     expect($model->currentStreakFor($subject, 'missing'))->toBe(0);
     expect($model->longestStreakFor($subject, 'missing'))->toBe(0);
+});
+
+it('backfills a date independently of today and caches it until the operation day ends', function () {
+    $subject = activitySubject();
+    expect($subject->recordDailyActivity('login', '2026-10-21'))->toBeTrue();
+    expect($subject->hasActivityOn('login', '2026-10-21'))->toBeTrue();
+    expect($subject->hasActivityOn('login', '2026-10-22'))->toBeFalse();
+    DB::enableQueryLog();
+    DB::flushQueryLog();
+    expect($subject->recordDailyActivity('login', '2026-10-21'))->toBeFalse();
+    expect(DB::getQueryLog())->toBeEmpty();
+    expect($subject->recordDailyActivity('login'))->toBeTrue();
+    expect((new DailyActivity)->recordFor($subject, 'login', null))->toBeFalse();
+    expect($subject->currentActivityStreak('login'))->toBe(2);
+    expect(Cache::getStore()->all())->toHaveCount(2);
+    $keys = array_keys(Cache::getStore()->all());
+    CarbonImmutable::setTestNow('2026-10-23 00:00:00');
+    foreach ($keys as $key) {
+        expect(Cache::has($key))->toBeFalse();
+    }
+    expect($subject->recordDailyActivity('login', '2026-10-21'))->toBeFalse();
+});
+
+it('backfills the correct year and leap day with Carbon inputs without changing them', function () {
+    $subject = activitySubject();
+    $date = Carbon::parse('2024-02-29 23:00:00');
+    expect($subject->recordDailyActivity('login', $date))->toBeTrue();
+    expect((new DailyActivity)->recordFor($subject, 'login', CarbonImmutable::parse('2025-12-31')))->toBeTrue();
+    expect($subject->hasActivityOn('login', '2024-02-29'))->toBeTrue();
+    expect($subject->hasActivityOn('login', '2025-12-31'))->toBeTrue();
+    expect($subject->hasActivityOn('login', '2024-02-28'))->toBeFalse();
+    expect($date->toDateTimeString())->toBe('2024-02-29 23:00:00');
+});
+
+it('normalizes explicit recording dates to the application timezone', function () {
+    config()->set('app.timezone', 'Asia/Shanghai');
+    $subject = activitySubject();
+    $date = Carbon::parse('2025-12-31 16:30:00', 'UTC');
+    expect($subject->recordDailyActivity('login', $date))->toBeTrue();
+    expect($subject->hasActivityOn('login', '2026-01-01'))->toBeTrue();
+    expect($subject->recordDailyActivity('login', '2025-12-31T16:30:00Z'))->toBeFalse();
+    expect($date->timezoneName)->toBe('UTC');
+    expect($date->toDateTimeString())->toBe('2025-12-31 16:30:00');
+});
+
+it('rejects invalid recording dates before writing or caching', function () {
+    $subject = activitySubject();
+    expect(fn () => $subject->recordDailyActivity('login', 'not-a-date'))
+        ->toThrow(InvalidFormatException::class);
+    expect(DailyActivity::count())->toBe(0);
+    expect(Cache::getStore()->all())->toBeEmpty();
+});
+
+it('does not cache a backfill until commit and allows retry after rollback', function () {
+    $subject = activitySubject();
+    DB::beginTransaction();
+    expect($subject->recordDailyActivity('login', '2025-12-31'))->toBeTrue();
+    expect(Cache::getStore()->all())->toBeEmpty();
+    DB::rollBack();
+    expect($subject->hasActivityOn('login', '2025-12-31'))->toBeFalse();
+    expect(Cache::getStore()->all())->toBeEmpty();
+    DB::beginTransaction();
+    expect($subject->recordDailyActivity('login', '2025-12-31'))->toBeTrue();
+    expect(Cache::getStore()->all())->toBeEmpty();
+    DB::commit();
+    expect(Cache::getStore()->all())->toHaveCount(1);
+    expect($subject->hasActivityOn('login', '2025-12-31'))->toBeTrue();
 });
 
 it('rejects invalid actions consistently before writing', function (string $action) {

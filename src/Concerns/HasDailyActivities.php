@@ -24,11 +24,11 @@ trait HasDailyActivities
     }
 
     /**
-     * 标记当前主体今天的指定活动，首次标记返回 true，重复标记返回 false。
+     * 标记当前主体指定日期的活动，省略日期时默认今天，首次标记返回 true，重复标记返回 false。
      */
-    public function recordDailyActivity(string $action): bool
+    public function recordDailyActivity(string $action, CarbonInterface|string|null $date = null): bool
     {
-        return $this->dailyActivityModel()->recordFor($this, $action);
+        return $this->dailyActivityModel()->recordFor($this, $action, $date);
     }
 
     /**

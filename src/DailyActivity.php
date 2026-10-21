@@ -63,19 +63,20 @@ class DailyActivity extends Model
     }
 
     /**
-     * 为指定主体标记今天的活动，通过缓存去重和比较后更新保留并发标记。
-     * 首次设置当天对应位时返回 true，重复标记返回 false，连续五次更新冲突后抛出异常。
+     * 为指定主体标记指定日期的活动，省略日期时默认今天，通过缓存去重和比较后更新保留并发标记。
+     * 首次设置目标日期对应位时返回 true，重复标记返回 false，连续五次更新冲突后抛出异常。
      */
-    public function recordFor(Model $subject, string $action): bool
+    public function recordFor(Model $subject, string $action, CarbonInterface|string|null $date = null): bool
     {
         $query = $this->queryFor($subject, $action)->useWritePdo();
         $now = CarbonImmutable::now(config('app.timezone', 'UTC'));
+        $date = $date === null ? $now : $this->activityDate($date);
         $model = $query->getModel();
         $connection = $model->getConnection();
         $key = 'daily-activity:'.hash('sha256', json_encode([
             $connection->getName(), $connection->getDatabaseName(), $model->getTable(),
             $model::class, $subject->getMorphClass(), $subject->getKey(), $action,
-            $now->toDateString(), $now->getTimezone()->getName(),
+            $date->toDateString(), $date->getTimezone()->getName(),
         ], JSON_THROW_ON_ERROR));
 
         try {
@@ -90,10 +91,10 @@ class DailyActivity extends Model
             'subject_type' => $subject->getMorphClass(),
             'subject_id' => $subject->getKey(),
             'action' => $action,
-            'year' => $now->year,
+            'year' => $date->year,
         ];
         $activity = (clone $query)->firstOrCreate($attributes);
-        $offset = $now->dayOfYear - 1;
+        $offset = $date->dayOfYear - 1;
 
         for ($attempt = 0; $attempt < 5; $attempt++) {
             $original = $activity->days;
@@ -117,7 +118,7 @@ class DailyActivity extends Model
                 return true;
             }
 
-            $activity = (clone $query)->where('year', $now->year)->firstOrFail();
+            $activity = (clone $query)->where('year', $date->year)->firstOrFail();
         }
 
         throw new RuntimeException('Daily activity could not be recorded after 5 concurrent update attempts.');
@@ -261,7 +262,7 @@ class DailyActivity extends Model
     /**
      * 校验主体和活动标识，选择模型连接并构建限定主体与活动类型的查询。
      *
-     * @return Builder<static>
+     * @return Builder<covariant self>
      */
     private function queryFor(Model $subject, string $action): Builder
     {
@@ -330,7 +331,7 @@ class DailyActivity extends Model
     }
 
     /**
-     * 在最外层事务提交后缓存成功标记，无事务时立即写入，有效期至记录当天结束。
+     * 在最外层事务提交后缓存成功标记，无事务时立即写入，有效期至本次操作当天结束。
      */
     private function cacheAfterCommit(self $model, string $key, CarbonImmutable $now): void
     {

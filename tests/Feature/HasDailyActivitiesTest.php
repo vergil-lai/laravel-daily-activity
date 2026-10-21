@@ -53,6 +53,8 @@ it('uses the configured model and table for every trait method', function () {
     expect($subject->currentActivityStreak('login'))->toBe(1);
     expect($subject->longestActivityStreak('login'))->toBe(1);
     expect($subject->dailyActivities->first())->toBeInstanceOf(CustomDailyActivity::class);
+    expect($subject->recordDailyActivity('login', '2025-12-31'))->toBeTrue();
+    expect($subject->hasActivityOn('login', '2025-12-31'))->toBeTrue();
     expect($subject->currentWeekActivity('login')['2026-10-22'])->toBeTrue();
     expect($subject->activityDaysInRange('login', '2026-10-01', '2026-10-31'))->toBe(1);
     expect($subject->currentMonthActivityDays('login'))->toBe(1);
@@ -142,6 +144,8 @@ it('inherits subject connections without retaining state and respects explicit a
     expect($second->dailyActivities()->count())->toBe(3);
     expect(DB::connection('second')->table('daily_activities')->count())->toBe(1);
     $connected = ConnectedSubject::create();
+    expect($second->recordDailyActivity('configured', '2025-12-31'))->toBeTrue();
+    expect($second->hasActivityOn('configured', '2025-12-31'))->toBeTrue();
     expect($connected->recordDailyActivity('login'))->toBeTrue();
     $stored = $connected->dailyActivities()->firstOrFail();
     expect($stored->getConnectionName())->toBe('first');
