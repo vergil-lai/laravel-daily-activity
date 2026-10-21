@@ -3,13 +3,20 @@
 declare(strict_types=1);
 
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
+afterEach(function () {
+    Carbon::setTestNow();
+});
+
 it('creates the portable activity table and reverses it', function () {
+    Carbon::setTestNow('2026-10-22 12:00:00');
     $this->artisan('vendor:publish', ['--tag' => 'laravel-daily-activity-migrations'])->assertSuccessful();
     $published = glob(database_path('migrations/*_create_daily_activities_table.php'));
     expect($published)->toHaveCount(1);
+    Carbon::setTestNow('2026-10-22 12:00:02');
     $this->artisan('vendor:publish', ['--tag' => 'laravel-daily-activity-migrations'])->assertSuccessful();
     expect(glob(database_path('migrations/*_create_daily_activities_table.php')))->toBe($published);
     $migration = require $published[0];

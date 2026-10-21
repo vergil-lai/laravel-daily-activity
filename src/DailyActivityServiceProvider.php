@@ -29,7 +29,7 @@ class DailyActivityServiceProvider extends ServiceProvider
             __DIR__.'/../config/daily-activity.php' => config_path('daily-activity.php'),
         ], ['laravel-daily-activity', 'laravel-daily-activity-config']);
 
-        $this->publishesMigrations([
+        $this->publishes([
             __DIR__.'/../database/migrations/2026_10_22_000000_create_daily_activities_table.php' => database_path('migrations/2026_10_22_000000_create_daily_activities_table.php'),
         ], ['laravel-daily-activity', 'laravel-daily-activity-migrations']);
     }
