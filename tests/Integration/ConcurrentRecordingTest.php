@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Carbon\CarbonImmutable;
+use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\DB;
 use Symfony\Component\Process\Process;
 use VergilLai\DailyActivity\DailyActivity;
@@ -67,10 +68,7 @@ it('preserves concurrent updates after both workers read the original bitmap', f
         DB::disconnect('concurrent');
         DB::setDefaultConnection($original);
         CarbonImmutable::setTestNow();
-        foreach (glob($directory.'/*') as $file) {
-            unlink($file);
-        }
-        rmdir($directory);
+        (new Filesystem)->deleteDirectory($directory);
     }
 })->with([
     'same day and first annual row' => [['2026-10-21', '2026-10-21'], 1, 1],

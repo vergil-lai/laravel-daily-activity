@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Carbon\CarbonImmutable;
+use Illuminate\Foundation\Application as LaravelApplication;
 use Orchestra\Testbench\Foundation\Application;
 use VergilLai\DailyActivity\DailyActivity;
 use VergilLai\DailyActivity\Tests\Fixtures\Models\Subject;
@@ -16,7 +17,11 @@ if (($config['driver'] === 'sqlite' && $config['database'] !== $directory.'/shar
     || ($config['driver'] !== 'sqlite' && $config['database'] !== 'daily_activity_test')) {
     throw new RuntimeException('Refusing to use an unrecognized test database.');
 }
-$app = Application::create();
+$bootstrap = $directory.'/bootstrap-'.$number;
+mkdir($bootstrap.'/cache', 0777, true);
+$app = Application::create(resolvingCallback: static function (LaravelApplication $app) use ($bootstrap): void {
+    $app->useBootstrapPath($bootstrap);
+});
 $app['config']->set('database.default', 'worker');
 $app['config']->set('database.connections.worker', $config);
 $app['config']->set('cache.default', 'array');
